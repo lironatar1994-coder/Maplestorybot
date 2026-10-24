@@ -1,0 +1,84 @@
+# MapleStory Worlds (Classic) training bot settings.
+# These are the defaults. The control panel's Settings tab saves your changes to settings.yaml,
+# which overrides the matching values here (delete settings.yaml to go back to these).
+# Screen regions live in calibration.yaml (written by `python calibrate.py regions`).
+# The route lives in the file named by `route` (written by `python calibrate.py route`).
+
+window_title: "MapleStory"   # game window title; an exact match wins, else the first title containing it
+window_process: MapleStory.exe   # only windows of this program count as the game (null = any program)
+
+# How Auto setup opens the game when it isn't running. "auto" looks for the
+# "MapleStory Classic World" shortcut on the Desktop / Start menu; or give a .lnk / .exe path.
+launch: auto
+login_timeout: 900     # seconds Auto setup waits for you to log in and enter a map
+calibration_file: calibration.yaml
+route: routes/default.yaml
+loop_hz: 15
+
+mode: route            # route = walk the recorded route; stand = attack in place without moving
+stand:
+  face: null           # left / right: turn that way first; null keeps the current facing
+  jump_every: 10       # seconds between jumps while attacking in place (0 = never jump)
+
+hotkeys:
+  toggle: f9    # start / pause
+  quit: f10
+
+# In-game key bindings. Names: a-z, 0-9, f1-f12, ctrl, alt, shift, space, enter, tab, esc,
+# left, right, up, down, insert, delete, home, end, pageup, pagedown, - = [ ] ; ' ` \ , . /
+keys:
+  left: left
+  right: right
+  up: up
+  down: down
+  jump: alt
+  attack: ctrl
+  hp_potion: delete
+  mp_potion: end      # set to null if you don't use MP potions
+
+healer:
+  hp_threshold: 0.50   # drink when HP bar is below 50%
+  mp_threshold: 0.30
+  cooldown: 1.0        # seconds between drinks of the same potion
+
+buffs:                 # each buff is recast every `interval` seconds
+  - key: "1"
+    interval: 180
+    cast_time: 1.0     # seconds to wait after pressing
+  # - key: "2"
+  #   interval: 120
+  #   cast_time: 1.0
+buff_overdue_grace: 5  # cast while moving if a buff is this many seconds overdue
+
+movement:
+  tolerance_x: 3       # minimap pixels: how close counts as "arrived"
+  tolerance_y: 3
+  jump_interval: 0.7   # seconds between jumps while climbing / dropping
+
+safety:
+  pause_on_other_player: true
+  other_player_frames: 3     # consecutive frames with a red dot before pausing
+  lost_player_seconds: 3     # player dot missing this long -> pause (map change, disconnect)
+  stuck_seconds: 8           # trying to move but the dot hasn't moved -> pause
+  template_dir: templates    # PNGs of popups that pause the bot (lie detector, death dialog, rune...)
+  template_threshold: 0.85
+  template_check_interval: 0.5
+  beeps: 5
+
+vision:
+  # OpenCV HSV ranges (H 0-180, S 0-255, V 0-255). Tune with `python calibrate.py check`
+  # (hover the zoomed minimap to read pixel values).
+  # Auto setup replaces player_hsv with a range fitted to your dot.
+  player_hsv:
+    - [[20, 155, 190], [34, 255, 255]]   # yellow (saturated enough to skip coins showing through)
+  other_player_hsv:
+    - [[0, 150, 150], [8, 255, 255]]     # red (hue wraps around)
+    - [[170, 150, 150], [180, 255, 255]]
+  dot_min_area: 6
+  dot_max_area: 150
+  dot_max_size: 10       # dots are round and at most this many px across
+
+  # A bar column counts as "filled" when this share of its pixels are colourful.
+  bar_sat_min: 90
+  bar_val_min: 90
+  bar_column_ratio: 0.3
