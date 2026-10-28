@@ -18,12 +18,14 @@ from tkinter.scrolledtext import ScrolledText
 
 import cv2
 import keyboard
+import numpy as np
 import win32gui
 
 from bot import capture, config
 from bot import keys as keymod
 from bot.autosetup import AutoSetup
 from bot.engine import Engine
+from bot.pathing import Layout, layout_path
 from bot.vision import Vision, crop
 
 HERE = Path(__file__).resolve().parent
@@ -49,7 +51,9 @@ POTION_FIELDS = [("healer.hp_threshold", "Drink HP below (%)", "pct"),
                  ("healer.cooldown", "Potion cooldown (s)", float)]
 MOVE_FIELDS = [("movement.tolerance_x", "Arrive within x (minimap px)", int),
                ("movement.tolerance_y", "Arrive within y (minimap px)", int),
-               ("movement.jump_interval", "Seconds between jumps", float)]
+               ("movement.jump_interval", "Seconds between jumps", float),
+               ("pathing.enabled", "Find paths between waypoints (learned map)", bool),
+               ("pathing.learn", "Keep learning the map while running", bool)]
 SAFETY_FIELDS = [("safety.pause_on_other_player", "Pause when another player shows up", bool),
                  ("safety.lost_player_seconds", "Pause if my dot is lost for (s)", float),
                  ("safety.stuck_seconds", "Pause if stuck for (s)", float),
@@ -103,6 +107,7 @@ class App:
         self.setup_thread = None
         self.setup_cancel = threading.Event()
         self.setup_results = None  # set by the Auto setup thread when it finishes
+        self.layout_cache = (None, None)  # ((file, mtime), learned ground points as an array)
 
         handler = QueueLogHandler(self.log_queue)
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%H:%M:%S"))
@@ -270,7 +275,7 @@ class App:
             self.info["waypoint"].config(text="stand mode: attacking in place" +
                                          (f", jumping every {jump:g}s" if jump else ""))
         else:
-            self.info["waypoint"].config(text=f"{st['index'] + 1} of {count} ({st['routine']})"
+            self.info["waypoint"].config(text=f"{st['index'] + 1} of {count} ({st['routine']}), lap {st['lap'] + 1}"
                                          if count and self.alive()
                                          else (f"{count} waypoints" if count else "no route recorded"))
         self.info["others"].config(text=str(len(st.get("others") or [])))
@@ -293,8 +298,19 @@ class App:
     def render_minimap(self, img, st):
         zoom = max(1, min(4, PREVIEW_WIDTH // max(1, img.shape[1])))
         view = cv2.resize(img, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_NEAREST)
+        ground = self.learned_ground()
+        if ground is not None and len(ground):
+            inside = (ground[:, 0] < img.shape[1]) & (ground[:, 1] < img.shape[0]) & (ground >= 0).all(axis=1)
+            mask = np.zeros(img.shape[:2], np.uint8)
+            mask[ground[inside, 1], ground[inside, 0]] = 1
+            mask = cv2.resize(mask, (view.shape[1], view.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+            view[mask] = (view[mask] * 0.45 + np.array((200, 150, 40)) * 0.55).astype(np.uint8)
         waypoints = (self.cfg.get("route_data") or {}).get("waypoints") or []
         target = st.get("index") if self.alive() else None
+        if st.get("path") and st.get("pos") and target is not None and target < len(waypoints):
+            line = [st["pos"], *st["path"], (waypoints[target]["x"], waypoints[target]["y"])]
+            pts = np.array([(int(x * zoom), int(y * zoom)) for x, y in line], np.int32)
+            cv2.polylines(view, [pts], False, (255, 120, 255), 1)
         for i, wp in enumerate(waypoints):
             centre = (int(wp["x"] * zoom), int(wp["y"] * zoom))
             colour = (80, 200, 80) if wp.get("action") == "attack" else (200, 200, 200)
@@ -307,10 +323,23 @@ class App:
             cv2.circle(view, (int(ox * zoom), int(oy * zoom)), 3 + zoom * 2, (0, 0, 255), 2)
         return view
 
+    def learned_ground(self):
+        """Ground points of the current route's learned map (reloaded when the file changes), or None."""
+        path = layout_path(self.cfg["route"])
+        try:
+            key = (path, path.stat().st_mtime)
+        except OSError:
+            return None
+        if self.layout_cache[0] != key:
+            ground = Layout.load(path).ground
+            self.layout_cache = (key, np.array(sorted(ground), np.int32).reshape(-1, 2))
+        return self.layout_cache[1]
+
     def idle_status(self):
         """What the bot would see right now, while it isn't running."""
         st = {"phase": "stopped", "reason": None, "pos": None, "others": [], "hp": None, "mp": None, "index": 0,
-              "count": len((self.cfg.get("route_data") or {}).get("waypoints") or []), "routine": "", "minimap": None}
+              "count": len((self.cfg.get("route_data") or {}).get("waypoints") or []), "routine": "", "minimap": None,
+              "lap": 0, "path": []}
         region = self.cfg["regions"].get("minimap")
         if not region:
             st["preview_msg"] = "No minimap region yet.\nUse Select regions in the Calibrate tab."
@@ -527,6 +556,8 @@ class App:
              lambda: self.run_calibrate("check")),
             ("5. Record route...", "Walk the route and mark points with F5/F6 (attack), F7 (pass), F8 (undo), "
                                    "F10 (save).", self.record_route),
+            ("Forget learned map", "Deletes what the bot learned about the current route's map (platforms, "
+                                   "ropes, paths). Recording the route again teaches it afresh.", self.forget_layout),
             ("Save popup template...", "With a popup on screen (lie detector, death...), box part of it. "
                                        "The bot pauses whenever it appears.", self.save_template),
             ("Open overlay image", "debug/overlay.png from the last regions or check run.", self.open_overlay),
@@ -588,6 +619,16 @@ class App:
         self.vars["route"][0].set(route)
         logging.getLogger("bot").info("Route set to %s.", route)
         self.run_calibrate("route", route)
+
+    def forget_layout(self):
+        path = layout_path(self.cfg["route"])
+        if not path.exists():
+            messagebox.showinfo("Nothing learned yet", f"There's no learned map for {self.cfg['route']} yet.")
+            return
+        if messagebox.askyesno("Forget learned map", f"Delete {path.as_posix()}? The bot walks straight toward "
+                               "each waypoint until it learns the map again."):
+            path.unlink(missing_ok=True)
+            logging.getLogger("bot").info("Deleted %s.", path.as_posix())
 
     def save_template(self):
         name = simpledialog.askstring("Popup template", "Name (letters, digits, - or _), e.g. lie_detector:",

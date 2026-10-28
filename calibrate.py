@@ -11,7 +11,9 @@
 """
 import argparse
 import logging
+import queue
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -19,7 +21,7 @@ from pathlib import Path
 import cv2
 import keyboard
 
-from bot import capture, config, vision
+from bot import capture, config, pathing, vision
 from bot.autosetup import AutoSetup
 from bot.keys import Keys
 
@@ -156,12 +158,20 @@ def cmd_route(cfg, args):
     seconds = float(input("Seconds to attack at each attack waypoint [6]: ") or 6)
     waypoints = route["waypoints"]
 
-    def record(action, face=None):
-        state = vis.read(grab_or_exit(game))
-        if not state.pos:
+    # The map is learned from every frame while you walk, so it keeps what earlier recordings learned.
+    layout_file = pathing.layout_path(path)
+    layout = pathing.Layout.load(layout_file)
+    size = [int(v) for v in cfg["regions"]["minimap"][2:]]
+    if layout.size not in (None, size):
+        print(f"{layout_file} was learned with a different minimap size: learning the map again.")
+        layout = pathing.Layout()
+    layout.size = size
+
+    def record(pos, action, face=None):
+        if not pos:
             print("  player dot not found, nothing recorded")
             return
-        wp = {"x": round(state.pos[0]), "y": round(state.pos[1]), "action": action}
+        wp = {"x": round(pos[0]), "y": round(pos[1]), "action": action}
         if action == "attack":
             wp.update(face=face, seconds=seconds)
         waypoints.append(wp)
@@ -171,19 +181,49 @@ def cmd_route(cfg, args):
         if waypoints:
             print(f"  removed {waypoints.pop()}")
 
-    keyboard.add_hotkey("f5", record, args=("attack", "left"))
-    keyboard.add_hotkey("f6", record, args=("attack", "right"))
-    keyboard.add_hotkey("f7", record, args=("pass",))
-    keyboard.add_hotkey("f8", undo)
+    # Hotkeys only queue requests: this thread does all the screen capture.
+    requests, done = queue.Queue(), threading.Event()
+    keyboard.add_hotkey("f5", requests.put, args=(("attack", "left"),))
+    keyboard.add_hotkey("f6", requests.put, args=(("attack", "right"),))
+    keyboard.add_hotkey("f7", requests.put, args=(("pass",),))
+    keyboard.add_hotkey("f8", requests.put, args=(("undo",),))
+    keyboard.add_hotkey("f10", done.set)
     print("Walk your character to each spot, in order, and press:\n"
           "  F5  attack here facing LEFT\n  F6  attack here facing RIGHT\n"
           "  F7  pass-through point (rope bottom/top, ledge edge)\n  F8  undo last\n  F10 save and quit\n"
-          "Tip: add pass points at the bottom and top of each rope and where you jump or drop between platforms.")
-    keyboard.wait("f10")
+          "Tip: add pass points at the bottom and top of each rope and where you jump or drop between platforms.\n"
+          "The bot also learns the map from how you move: walk every platform and climb every rope it may need,\n"
+          "including the way back up after being knocked down.")
+    period = 1.0 / cfg["loop_hz"]
+    pos, missing_since = None, None
+    while not done.is_set():
+        start = time.monotonic()
+        frame = game.grab()
+        pos = vis.read(frame).pos if frame is not None else None
+        if pos:
+            layout.observe(pos, start)
+            missing_since = None
+        else:
+            layout.break_trace()
+            if frame is None and missing_since is None:
+                print("  game window not found (minimized?); waiting for it")
+                missing_since = start
+        while not requests.empty():
+            request = requests.get()
+            if request == ("undo",):
+                undo()
+            else:
+                record(pos, *request)
+        time.sleep(max(0.0, period - (time.monotonic() - start)))
     keyboard.unhook_all()
     route["mode"] = route.get("mode", "loop")
     config.save_yaml(path, route)
     print(f"Saved {len(waypoints)} waypoints to {path}. Set mode: pingpong there to walk the route back and forth.")
+    if layout.dirty:
+        layout.save(layout_file)
+        print(f"Learned map: {len(layout.ground)} ground points, saved to {layout_file}.")
+    else:
+        print("Nothing new learned about the map.")
 
 
 def cmd_template(cfg, args):

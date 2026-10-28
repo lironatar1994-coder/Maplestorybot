@@ -1,10 +1,17 @@
 """Walks the recorded waypoint route and attacks at each attack waypoint.
 
 Minimap y grows downwards, so a target with a smaller y is higher up.
-Moving to a waypoint:
+Moving to a point:
   - far away horizontally: walk toward it (jumping now and then if it is also higher)
   - directly above: hold up and jump, to grab a rope/ladder and climb it
   - directly below: hold down and jump, to drop through the platform
+With a learned map (bot/pathing.py) it heads for the next waypoint through the points of a path
+it has walked before (platform edges, rope bottoms and tops), and finds the way back after being
+knocked off a platform. With no known path it heads straight for the waypoint.
+
+A waypoint with `every: N` is only visited on every Nth lap of the route; `skip_first: true`
+also leaves it out of the first lap. A lap is one pass from the first waypoint to the last
+(and, in pingpong mode, back again).
 
 In stand mode (config `mode: stand`) it ignores the route: it holds attack where the character
 stands and jumps every `stand.jump_every` seconds.
@@ -15,13 +22,15 @@ log = logging.getLogger(__name__)
 
 
 class Routine:
-    def __init__(self, cfg, keys):
+    def __init__(self, cfg, keys, layout=None):
         route = cfg["route_data"] or {}
         self.waypoints = route.get("waypoints") or []
         self.order = route.get("mode", "loop")
         self.k = cfg["keys"]
         m = cfg["movement"]
         self.tol_x, self.tol_y, self.jump_interval = m["tolerance_x"], m["tolerance_y"], m["jump_interval"]
+        self.layout = layout  # bot.pathing.Layout to find paths with, or None to head straight for each waypoint
+        self.replan_interval = (cfg.get("pathing") or {}).get("replan_interval", 0.5)
         self.stand = cfg.get("mode", "route") == "stand"
         stand = cfg.get("stand") or {}
         self.stand_face = stand.get("face")
@@ -29,10 +38,16 @@ class Routine:
         self.keys = keys
         self.index = 0
         self.step = 1
+        self.lap = 0
+        self.path = []          # points to pass on the way to the current waypoint
+        self.path_for = None    # index of the waypoint that path leads to
+        self.last_plan = float("-inf")
         self.state = "attacking" if self.stand else "moving"
         self.attack_until = 0.0
         self.last_jump = 0.0
         self.faced = False
+        if self.waypoints and not self._due(0):
+            self._advance()
 
     @property
     def moving(self):
@@ -50,6 +65,7 @@ class Routine:
         """Called after a pause: head for the current waypoint again (or face the set way again in stand mode)."""
         self.state = "attacking" if self.stand else "moving"
         self.faced = False
+        self.path_for = None  # you may have moved the character while it was paused
 
     def tick(self, pos, now):
         if self.stand:
@@ -66,10 +82,35 @@ class Routine:
                 self.keys.down(self.k["attack"])  # re-held after a potion/buff released it
             return
 
-        dx, dy = wp["x"] - pos[0], wp["y"] - pos[1]
-        if abs(dx) <= wp.get("tol_x", self.tol_x) and abs(dy) <= wp.get("tol_y", self.tol_y):
+        tol_x, tol_y = wp.get("tol_x", self.tol_x), wp.get("tol_y", self.tol_y)
+        if abs(wp["x"] - pos[0]) <= tol_x and abs(wp["y"] - pos[1]) <= tol_y:
             self._arrive(wp, now)
-        elif abs(dx) > wp.get("tol_x", self.tol_x):
+            return
+        point = self._next_point(pos, now)
+        if point:
+            self._move(point[0] - pos[0], point[1] - pos[1], self.tol_x, now)
+        else:
+            self._move(wp["x"] - pos[0], wp["y"] - pos[1], tol_x, now)
+
+    def _next_point(self, pos, now):
+        """The next point of the learned path to the current waypoint, or None to head straight for it."""
+        if self.layout is None:
+            return None
+        new_target = self.path_for != self.index
+        # Plan again now and then while on solid ground (after a knockback, say), never in mid-jump or mid-climb.
+        if new_target or (now - self.last_plan >= self.replan_interval and self.layout.on_ground(pos)):
+            wp = self.target
+            path = self.layout.plan(pos, (wp["x"], wp["y"]))
+            if path is None and new_target:
+                log.info("No learned path to waypoint %d yet: heading straight for it.", self.index + 1)
+            self.path = path or []
+            self.path_for, self.last_plan = self.index, now
+        while self.path and abs(self.path[0][0] - pos[0]) <= self.tol_x and abs(self.path[0][1] - pos[1]) <= self.tol_y:
+            self.path.pop(0)
+        return self.path[0] if self.path else None
+
+    def _move(self, dx, dy, tol_x, now):
+        if abs(dx) > tol_x:
             toward, away = ("right", "left") if dx > 0 else ("left", "right")
             self._release(away, "up", "down")
             self.keys.down(self.k[toward])
@@ -120,15 +161,32 @@ class Routine:
         else:
             self._advance()
 
+    def _due(self, i):
+        """Whether waypoint i is visited on this lap."""
+        wp = self.waypoints[i]
+        return self.lap % wp.get("every", 1) == 0 and not (wp.get("skip_first") and self.lap == 0)
+
     def _advance(self):
         self.state = "moving"
         n = len(self.waypoints)
         if n <= 1:
             return
+        # Some other waypoint is due within max(every) laps, so this always finds one well before the limit.
+        # In pingpong mode it turns around at the last waypoint due this lap instead of revisiting it.
+        start, longest = self.index, max(wp.get("every", 1) for wp in self.waypoints)
+        for _ in range(2 * n * (longest + 1)):
+            self._step()
+            if self._due(self.index) and (self.order != "pingpong" or self.index != start):
+                break
+        log.info("-> waypoint %d %s", self.index + 1, self.target)
+
+    def _step(self):
+        n = len(self.waypoints)
         if self.order == "pingpong":
             if not 0 <= self.index + self.step < n:
                 self.step = -self.step
             self.index += self.step
         else:
             self.index = (self.index + 1) % n
-        log.info("-> waypoint %d %s", self.index + 1, self.target)
+        if self.index == 0:
+            self.lap += 1

@@ -55,6 +55,14 @@ movement:
   tolerance_y: 3
   jump_interval: 0.7   # seconds between jumps while climbing / dropping
 
+pathing:
+  # The bot learns the map from how your character moves (while you record a route, and while it runs),
+  # saved next to the route as <route>.layout.json. With it, it finds its way between waypoints over
+  # platforms and ropes it has used before, and back after being knocked off a platform.
+  enabled: true          # use learned paths (false = walk straight toward each waypoint, as before)
+  learn: true            # keep learning while the bot runs (recording a route always learns)
+  replan_interval: 0.5   # seconds between path checks while standing on known ground
+
 safety:
   pause_on_other_player: true
   other_player_frames: 3     # consecutive frames with a red dot before pausing

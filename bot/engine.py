@@ -7,6 +7,7 @@ from bot import capture, detect
 from bot.buffs import Buffs
 from bot.healer import Healer
 from bot.keys import Keys
+from bot.pathing import Layout, layout_path
 from bot.routine import Routine
 from bot.safety import Safety
 from bot.vision import TemplateWatcher, Vision, crop
@@ -22,14 +23,24 @@ class Engine:
         self.vision = Vision(cfg)
         self.healer = Healer(cfg, self.keys)
         self.buffs = Buffs(cfg.get("buffs"), self.keys, cfg["buff_overdue_grace"])
-        self.routine = Routine(cfg, self.keys)
+        pathing = cfg.get("pathing") or {}
+        route_mode = cfg.get("mode", "route") != "stand"
+        use_paths = route_mode and bool(pathing.get("enabled"))
+        self.learn = route_mode and bool(pathing.get("learn"))
+        self.layout_file = layout_path(cfg["route"])
+        self.layout = Layout.load(self.layout_file) if use_paths or self.learn else None
+        self.routine = Routine(cfg, self.keys, self.layout if use_paths else None)
+        self.learning = False
+        self._lost_since = None
+        self._last_save = 0.0
         self.watcher = TemplateWatcher(cfg["safety"]["template_dir"], cfg["safety"]["template_threshold"])
         self.safety = Safety(cfg, self.watcher)
         self.running = threading.Event()
         self.stopping = threading.Event()
         self._lock = threading.Lock()
         self._status = {"phase": "paused", "reason": None, "pos": None, "others": [], "hp": None, "mp": None,
-                        "index": 0, "count": len(self.routine.waypoints), "routine": "moving", "minimap": None}
+                        "index": 0, "count": len(self.routine.waypoints), "routine": "moving", "minimap": None,
+                        "lap": 0, "path": []}
 
     # Control (safe to call from any thread)
     def resume(self):
@@ -71,6 +82,42 @@ class Engine:
         regions["minimap"] = found
         self.safety.has_minimap = True
 
+    def _check_layout(self):
+        """Drops the learned map if it was made with the minimap zoomed differently (every position would be off)."""
+        minimap = self.cfg["regions"].get("minimap")
+        if self.layout is None or not minimap:
+            return
+        size = [int(v) for v in minimap[2:]]
+        if self.layout.size is None:
+            self.layout.size = size
+        elif list(self.layout.size) != size:
+            log.warning("%s was learned with a %dx%d minimap, but it's %dx%d now: not using it. Undo the zoom, "
+                        "or delete that file to learn the map again.", self.layout_file, *self.layout.size, *size)
+            self.layout = self.routine.layout = None
+            self.learning = False
+
+    def _learn(self, pos, now):
+        """Feeds the learned map. Stops at the first sign of a map change, until the next Start."""
+        if pos:
+            self._lost_since = None
+            self.layout.observe(pos, now)
+            if self.layout.dirty and now - self._last_save >= 30:
+                self._save_layout(now)
+            return
+        self.layout.break_trace()
+        if self._lost_since is None:
+            self._lost_since = now
+        elif now - self._lost_since >= 1.0:
+            log.info("Lost the dot: not learning the map again until the next Start, in case this is another map.")
+            self.learning = False
+
+    def _save_layout(self, now):
+        try:
+            self.layout.save(self.layout_file)
+        except OSError as e:
+            log.warning("Couldn't save the learned map to %s: %s", self.layout_file, e)
+        self._last_save = now
+
     def run(self):
         """Blocking loop; returns after stop()."""
         cfg = self.cfg
@@ -82,6 +129,9 @@ class Engine:
         else:
             log.info("Loaded %d waypoints, %d buffs, %d popup templates.%s", len(self.routine.waypoints),
                      len(self.buffs.buffs), len(self.watcher.templates), " (dry run)" if self.dry_run else "")
+            if self.routine.layout is not None:
+                log.info("Pathfinding %s.", f"on ({len(self.layout.ground)} learned ground points)"
+                         if not self.layout.empty else "on, but nothing learned yet: record the route to teach it")
         if not self.routine.stand and not self.routine.waypoints:
             log.warning("Route %s has no waypoints: the bot will only drink potions and buff.", cfg["route"])
         game = capture.game_window(cfg)  # mss handles belong to the thread that made them
@@ -102,6 +152,10 @@ class Engine:
                 if not was_running:
                     self.routine.resume()
                     self.safety.reset()
+                    if self.layout is not None:
+                        self.layout.break_trace()
+                    self.learning = self.learn and self.layout is not None
+                    self._lost_since = None
                     self._publish(reason=None)
                     was_running = True
                     check_minimap = True
@@ -118,9 +172,12 @@ class Engine:
                     continue
                 if check_minimap:
                     self._follow_minimap(frame)
+                    self._check_layout()
                     check_minimap = False
 
                 state = self.vision.read(frame)
+                if self.learning:
+                    self._learn(state.pos, start)
                 minimap = crop(frame, cfg["regions"].get("minimap"))
                 self._publish(phase="running", pos=state.pos, others=state.others, hp=state.hp, mp=state.mp,
                               minimap=None if minimap is None else minimap.copy())
@@ -142,7 +199,8 @@ class Engine:
                     continue
                 if state.pos or self.routine.stand:  # stand mode doesn't need a position
                     self.routine.tick(state.pos, start)
-                self._publish(index=self.routine.index, routine=self.routine.state)
+                self._publish(index=self.routine.index, routine=self.routine.state, lap=self.routine.lap,
+                              path=list(self.routine.path))
 
                 if start - last_status >= 5:
                     hp = f"{state.hp:.0%}" if state.hp is not None else "n/a"
@@ -154,5 +212,8 @@ class Engine:
                 time.sleep(max(0.0, period - (time.monotonic() - start)))
         finally:
             self.keys.release_all()
+            if self.layout is not None and self.layout.dirty:
+                self._save_layout(time.monotonic())
+                log.info("Saved what it learned about the map to %s.", self.layout_file)
             self._publish(phase="stopped")
             log.info("Stopped.")

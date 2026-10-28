@@ -65,7 +65,30 @@ Each time you press Start, the bot finds the minimap again, so moving the minima
 | F8 | undo last |
 | F10 | save and quit |
 
-Add pass points at the bottom and top of each rope, and at the spots where you jump up or drop down. The bot walks straight toward the next point, climbs (up + jump) when the point is directly above, and drops (down + jump) when it's directly below. Set `mode: pingpong` in the route file to walk it back and forth instead of looping. You can edit any waypoint's `seconds` or `face`, or add `tol_x` / `tol_y`, by hand.
+Add pass points at the bottom and top of each rope, and at the spots where you jump up or drop down. The bot walks toward the next point, climbs (up + jump) when the point is directly above, and drops (down + jump) when it's directly below. Set `mode: pingpong` in the route file to walk it back and forth instead of looping. You can edit any waypoint's `seconds` or `face`, or add `tol_x` / `tol_y`, by hand.
+
+While you record, the bot also learns the map from how you move (see **Pathfinding** below), so walk every platform and climb every rope it may need, including the way back up from below.
+
+### Waypoints that only run some laps
+
+A lap is one pass through the route (in pingpong mode, there and back). Add `every` to a waypoint in the route file to visit it only every Nth lap, and `skip_first: true` to also leave it out of the first lap:
+
+```yaml
+waypoints:
+  - {x: 40, y: 80, action: attack, face: left, seconds: 6}
+  - {x: 95, y: 30, action: attack, face: right, seconds: 8, every: 3}                 # laps 1, 4, 7...
+  - {x: 120, y: 30, action: attack, face: left, seconds: 8, every: 2, skip_first: true}  # laps 3, 5, 7...
+```
+
+A skipped waypoint isn't walked to at all, so for a detour (say, a far platform every third lap) put the same `every` on each of its points. The Run tab shows the current lap.
+
+## Pathfinding
+
+The bot keeps a map of where your character has been, saved next to the route as `routes/<name>.layout.json`. It learns the spots you stood or walked on, and which moves you made between them: walks, rope climbs, jumps and drops. Walks and climbs work both ways; drops and falls only go down, so climb each rope up at least once.
+
+With that map it finds the shortest path (A*) to the next waypoint and walks it point by point: to the platform edge, down the drop, to the rope, up the rope, and so on. After a monster knocks the character off a platform, it plans again from where it lands. Where the map has no path yet, it walks straight toward the waypoint as before. It learns while you record a route and, unless you turn it off, while it runs.
+
+The Run tab's minimap shows the learned ground in blue and the planned path in pink. To start over, use **Forget learned map** in the Calibrate tab. Turn pathfinding off in Settings (Movement) to go back to straight lines. The map is tied to the minimap's size: after zooming it with +/-, the bot ignores the old map until you undo the zoom or delete the file.
 
 ## Stand mode (attack in place)
 

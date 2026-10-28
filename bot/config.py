@@ -45,4 +45,9 @@ def load(path="config.yaml", settings_path=SETTINGS_FILE):
             keys.validate(name)
     for buff in cfg.get("buffs") or []:
         keys.validate(buff["key"])
+    for i, wp in enumerate(cfg["route_data"].get("waypoints") or [], 1):
+        every = wp.get("every", 1)
+        if isinstance(every, bool) or not isinstance(every, int) or every < 1:
+            raise ValueError(f"{cfg['route']}, waypoint {i}: `every` must be a whole number of laps (1 or more), "
+                             f"not {every!r}")
     return cfg
