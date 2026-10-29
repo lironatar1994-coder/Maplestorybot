@@ -53,15 +53,26 @@ def bar_fill(img, sat_min, val_min, column_ratio):
     return float((coloured.mean(axis=0) >= column_ratio).mean())
 
 
+HUD_REGIONS = ("hp_bar", "mp_bar")  # parts of the bottom-centre HUD
+
+
 class Vision:
     def __init__(self, cfg):
         self.v = cfg["vision"]
         self.regions = cfg["regions"]
+        self.calibrated_width = cfg.get("calibrated_width", 1024)
         self.last_pos = None
+
+    def regions_for(self, frame):
+        """The calibrated regions placed on this frame: the HUD stays centred, so on a wider or narrower
+        screen than the one it was calibrated on, the HP/MP bars move sideways by half the difference."""
+        dx = round((frame.shape[1] - self.calibrated_width) / 2)
+        return {name: [r[0] + dx, *r[1:]] if r and name in HUD_REGIONS else r for name, r in self.regions.items()}
 
     def read(self, frame):
         v, state = self.v, State()
-        minimap = crop(frame, self.regions.get("minimap"))
+        regions = self.regions_for(frame)
+        minimap = crop(frame, regions.get("minimap"))
         if minimap is not None and minimap.size:
             size = v.get("dot_max_size")
             players = find_blobs(minimap, v["player_hsv"], v["dot_min_area"], v["dot_max_area"], size)
@@ -70,7 +81,7 @@ class Vision:
             state.others = find_blobs(minimap, v["other_player_hsv"], v["dot_min_area"], v["dot_max_area"], size)
         self.last_pos = state.pos
         for name in ("hp", "mp"):
-            bar = crop(frame, self.regions.get(f"{name}_bar"))
+            bar = crop(frame, regions.get(f"{name}_bar"))
             if bar is not None and bar.size:
                 setattr(state, name, bar_fill(bar, v["bar_sat_min"], v["bar_val_min"], v["bar_column_ratio"]))
         return state

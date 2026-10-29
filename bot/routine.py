@@ -41,6 +41,7 @@ class Routine:
         self.lap = 0
         self.path = []          # points to pass on the way to the current waypoint
         self.path_for = None    # index of the waypoint that path leads to
+        self.goal = None        # or the point off the route it leads to (see go_to)
         self.last_plan = float("-inf")
         self.state = "attacking" if self.stand else "moving"
         self.attack_until = 0.0
@@ -104,10 +105,34 @@ class Routine:
             if path is None and new_target:
                 log.info("No learned path to waypoint %d yet: heading straight for it.", self.index + 1)
             self.path = path or []
-            self.path_for, self.last_plan = self.index, now
+            self.path_for, self.goal, self.last_plan = self.index, None, now
+        return self._path_point(pos)
+
+    def _path_point(self, pos):
         while self.path and abs(self.path[0][0] - pos[0]) <= self.tol_x and abs(self.path[0][1] - pos[1]) <= self.tol_y:
             self.path.pop(0)
         return self.path[0] if self.path else None
+
+    def go_to(self, pos, goal, now):
+        """Heads for a point off the route (a monster on another platform), through the learned map's points if it
+        knows a way there, else straight for it."""
+        if self.layout is None:
+            self.path, self.path_for = [], None
+        else:
+            moved = self.goal is None or max(abs(goal[0] - self.goal[0]), abs(goal[1] - self.goal[1])) > 3
+            if moved or (now - self.last_plan >= self.replan_interval and self.layout.on_ground(pos)):
+                self.path = self.layout.plan(pos, goal) or []
+                self.goal, self.path_for, self.last_plan = goal, None, now
+        point = self._path_point(pos) or goal
+        dx, dy = point[0] - pos[0], point[1] - pos[1]
+        if abs(dx) <= self.tol_x and abs(dy) <= self.tol_y:
+            self._release("left", "right", "up", "down")  # there (it's the hunter's call what to do next)
+        else:
+            self._move(dx, dy, self.tol_x, now)
+
+    def step_toward(self, dx, dy, now):
+        """One step toward a point dx, dy minimap px away, with no position to plan from."""
+        self._move(dx, dy, self.tol_x, now)
 
     def _move(self, dx, dy, tol_x, now):
         if abs(dx) > tol_x:

@@ -80,24 +80,26 @@ def cmd_regions(cfg, args):
     print(f"Captured {game.title!r} ({frame.shape[1]}x{frame.shape[0]}).")
     print("Tip: for the minimap, box only the map area, not the title bar with the map name.")
     cal = config.read_yaml(cfg["calibration_file"], {}) or {}
-    regions = cal.get("regions", {})
+    regions = vision.Vision(cfg).regions_for(frame)  # bars you skip stay where they were on screen
     for name, label in (("minimap", "minimap"), ("hp_bar", "HP bar (whole bar, full width)"),
                         ("mp_bar", "MP bar (whole bar, full width)")):
         region = select(frame, label)
         if region:
             regions[name] = region
     cal["regions"] = regions
+    cal["frame_width"] = frame.shape[1]
     config.save_yaml(cfg["calibration_file"], cal)
     print(f"Saved to {cfg['calibration_file']}.")
-    cfg["regions"] = regions
+    cfg["regions"], cfg["calibrated_width"] = regions, frame.shape[1]
     write_overlay(cfg, frame)
 
 
 def write_overlay(cfg, frame):
-    state = vision.Vision(cfg).read(frame)
+    vis = vision.Vision(cfg)
+    state = vis.read(frame)
     DEBUG.mkdir(exist_ok=True)
     cv2.imwrite(str(DEBUG / "screenshot.png"), frame)
-    cv2.imwrite(str(DEBUG / "overlay.png"), vision.draw_overlay(frame, cfg["regions"], state))
+    cv2.imwrite(str(DEBUG / "overlay.png"), vision.draw_overlay(frame, vis.regions_for(frame), state))
     print(f"Player dot: {state.pos}  others: {len(state.others)}  HP: {fmt(state.hp)}  MP: {fmt(state.mp)}")
     print(f"Overlay written to {DEBUG / 'overlay.png'}")
 

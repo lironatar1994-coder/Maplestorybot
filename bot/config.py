@@ -6,6 +6,7 @@ import yaml
 from bot import keys
 
 SETTINGS_FILE = "settings.yaml"
+MODES = ("route", "stand", "hunt")
 
 def read_yaml(path, default=None):
     path = Path(path)
@@ -38,13 +39,19 @@ def load(path="config.yaml", settings_path=SETTINGS_FILE):
     if cfg is None:
         raise FileNotFoundError(path)
     deep_merge(cfg, read_yaml(settings_path, {}) or {})
-    cfg["regions"] = (read_yaml(cfg["calibration_file"], {}) or {}).get("regions", {})
+    cal = read_yaml(cfg["calibration_file"], {}) or {}
+    cfg["regions"] = cal.get("regions", {})
+    cfg["calibrated_width"] = cal.get("frame_width", 1024)  # older calibrations were all made in a 1024x768 window
     cfg["route_data"] = read_yaml(cfg["route"], {"mode": "loop", "waypoints": []})
     for name in cfg["keys"].values():
         if name is not None:
             keys.validate(name)
     for buff in cfg.get("buffs") or []:
         keys.validate(buff["key"])
+    if cfg.get("mode", "route") not in MODES:
+        raise ValueError(f"mode must be one of {', '.join(MODES)}, not {cfg.get('mode')!r}")
+    if (cfg.get("hunt") or {}).get("attack_key"):
+        keys.validate(cfg["hunt"]["attack_key"])
     for i, wp in enumerate(cfg["route_data"].get("waypoints") or [], 1):
         every = wp.get("every", 1)
         if isinstance(every, bool) or not isinstance(every, int) or every < 1:

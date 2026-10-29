@@ -1,6 +1,11 @@
-"""Keyboard output through SendInput with hardware scan codes."""
+"""Keyboard output through SendInput with hardware scan codes.
+
+A held key repeats its key-down about 30 times a second, as a real keyboard does: the game acts on
+each key-down, so a key pressed down once and left there attacks or jumps only once.
+"""
 import ctypes
 import logging
+import threading
 import time
 from ctypes import wintypes
 
@@ -12,6 +17,7 @@ INPUT_KEYBOARD = 1
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
+REPEAT = 1 / 30  # seconds between repeated key-downs of a held key
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -68,6 +74,8 @@ class Keys:
     def __init__(self, dry_run=False):
         self.dry_run = dry_run
         self.held = set()
+        self._lock = threading.Lock()  # a repeat never lands after its key's key-up
+        self._repeater = None          # thread repeating the held keys; runs only while some are held
 
     def _send(self, name, key_up):
         if self.dry_run:
@@ -86,22 +94,39 @@ class Keys:
 
     def down(self, name):
         name = name.lower()
-        if name not in self.held:
+        with self._lock:
+            if name in self.held:
+                return
             self._send(name, False)
             self.held.add(name)
+            if self._repeater is None and not self.dry_run:
+                self._repeater = threading.Thread(target=self._repeat, daemon=True)
+                self._repeater.start()
+
+    def _repeat(self):
+        while True:
+            time.sleep(REPEAT)
+            with self._lock:
+                if not self.held:
+                    self._repeater = None
+                    return
+                for name in self.held:
+                    self._send(name, False)
 
     def up(self, name):
         name = name.lower()
-        if name in self.held:
-            self._send(name, True)
-            self.held.discard(name)
+        with self._lock:
+            if name in self.held:
+                self._send(name, True)
+                self.held.discard(name)
 
     def press(self, name, hold=0.05):
         name = name.lower()
-        self._send(name, False)
+        with self._lock:
+            self.held.discard(name)  # no repeats while it's pressed, and it ends up released
+            self._send(name, False)
         time.sleep(hold)
         self._send(name, True)
-        self.held.discard(name)
 
     def release_all(self):
         for name in list(self.held):

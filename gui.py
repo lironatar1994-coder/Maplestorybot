@@ -25,6 +25,7 @@ from bot import capture, config
 from bot import keys as keymod
 from bot.autosetup import AutoSetup
 from bot.engine import Engine
+from bot.overlay import AMBER as LINE_AMBER, RED as LINE_RED, Overlay, StatusLine
 from bot.pathing import Layout, layout_path
 from bot.vision import Vision, crop
 
@@ -58,9 +59,12 @@ SAFETY_FIELDS = [("safety.pause_on_other_player", "Pause when another player sho
                  ("safety.lost_player_seconds", "Pause if my dot is lost for (s)", float),
                  ("safety.stuck_seconds", "Pause if stuck for (s)", float),
                  ("safety.template_threshold", "Popup match threshold (0-1)", float)]
-MODE_FIELDS = [("mode", "Mode (route = walk it, stand = attack in place)", ("choice", ["route", "stand"])),
+MODE_FIELDS = [("mode", "Mode (route = walk it, stand = attack in place,\nhunt = find monsters and throw at them)",
+                ("choice", ["route", "stand", "hunt"])),
                ("stand.face", "Stand: face this way first", ("choice", ["", "left", "right"])),
-               ("stand.jump_every", "Stand: jump every (s, 0 = never)", float)]
+               ("stand.jump_every", "Stand: jump every (s, 0 = never)", float),
+               ("hunt.attack_key", "Hunt: attack key (blank = Attack)", "key?"),
+               ("hunt.range", "Hunt: star range (px; 400 with Keen Eyes)", int)]
 ALL_FIELDS = GAME_FIELDS + MODE_FIELDS + KEY_FIELDS + POTION_FIELDS + MOVE_FIELDS + SAFETY_FIELDS
 
 
@@ -107,6 +111,11 @@ class App:
         self.setup_thread = None
         self.setup_cancel = threading.Event()
         self.setup_results = None  # set by the Auto setup thread when it finishes
+        self.setup_updates = queue.Queue()  # Auto setup thread -> overlay: (ok, message)
+        self.overlay = Overlay(root)
+        self.status_line = StatusLine(root)  # one line over the game while the bot works
+        self.view_win = None                  # the Bot view window, while open
+        self.last_overlay_place = 0.0
         self.layout_cache = (None, None)  # ((file, mtime), learned ground points as an array)
 
         handler = QueueLogHandler(self.log_queue)
@@ -146,7 +155,10 @@ class App:
         for btn in (self.start_btn, self.pause_btn, self.stop_btn, self.auto_btn):
             btn.pack(side="left", padx=(0, 6))
         self.dry_run = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="Dry run (log keys, don't press them)", variable=self.dry_run).pack(side="left", padx=12)
+        ttk.Checkbutton(bar, text="Dry run", variable=self.dry_run).pack(side="left", padx=(12, 6))
+        ttk.Button(bar, text="Bot view", command=self.open_view).pack(side="left", padx=(6, 0))
+        self.record_view = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Record bot view", variable=self.record_view).pack(side="left", padx=6)
 
         self.banner = tk.Label(tab, text="Stopped", fg="white", bg=GREY, anchor="w", padx=10, pady=6,
                                font=("Segoe UI", 11, "bold"))
@@ -194,23 +206,30 @@ class App:
         if self.setting_up():
             logging.getLogger("bot").info("Auto setup is still running; Start is available when it finishes.")
             return
+        self.overlay.hide()
         if self.alive():
             self.engine.resume()
             return
         try:
             cfg = config.load()
         except Exception as e:  # bad key name, broken YAML...
-            messagebox.showerror("Can't start", str(e))
+            self.notify("Can't start", str(e))
             return
         if cfg.get("mode") != "stand" and not cfg["regions"].get("minimap"):
-            messagebox.showwarning("Calibrate first", "No minimap region yet. Use Select regions in the Calibrate "
-                                   "tab, or switch Training mode to stand in Settings.")
+            self.notify("Can't start: set up first", "No minimap region yet. Run Auto setup, or switch "
+                                                     "Training mode to stand in Settings.")
             return
         self.cfg = cfg
-        self.engine = Engine(cfg, dry_run=self.dry_run.get())
+        self.engine = Engine(cfg, dry_run=self.dry_run.get(), record=self.record_view.get())
         self.engine.resume()
         self.thread = threading.Thread(target=self.engine.run, daemon=True)
         self.thread.start()
+
+    def notify(self, title, text):
+        """A problem shown over the game for a few seconds (F9 is often pressed from inside it)."""
+        logging.getLogger("bot").error("%s: %s", title, text)
+        self.overlay.show(self.game_rect(), title)
+        self.overlay.finish(title, [text], "", 10)
 
     def pause(self):
         if self.alive():
@@ -223,6 +242,7 @@ class App:
             self.start()
 
     def stop(self):
+        self.overlay.hide()
         if self.alive():
             self.engine.stop()
         if self.setting_up():
@@ -237,26 +257,94 @@ class App:
             messagebox.showerror("Can't run Auto setup", str(e))
             return
         self.setup_cancel = threading.Event()
-        setup = AutoSetup(cfg, cancel=self.setup_cancel, launch=self.open_game.get())
+        self.setup_updates = queue.Queue()
+        setup = AutoSetup(cfg, cancel=self.setup_cancel, launch=self.open_game.get(),
+                          on_update=lambda ok, msg: self.setup_updates.put((ok, msg)))
         self.setup_results = None
 
         def work():
             self.setup_results = setup.run()
 
-        logging.getLogger("bot").info("Auto setup started. Keep the game in front; Stop (F10) cancels.")
+        quit_key = cfg["hotkeys"]["quit"].upper()
+        logging.getLogger("bot").info("Auto setup started. Keep the game in front; Stop (%s) cancels.", quit_key)
+        # Shown before the setup brings the game to the front, and it never takes focus itself.
+        self.overlay.show(self.game_rect(), "Auto setup")
+        self.overlay.add(None, f"Starting... {quit_key} cancels.")
         self.setup_thread = threading.Thread(target=work, daemon=True)
         self.setup_thread.start()
         self.tabs.select(0)
 
+    def game_rect(self):
+        """Where the game is on screen (its client area), or the main screen while it isn't open."""
+        game = self.preview_game
+        if (game.hwnd and win32gui.IsWindow(game.hwnd)) or game.locate():
+            x, y, w, h = game.client_rect()
+            if w > 0 and h > 0 and not win32gui.IsIconic(game.hwnd):
+                return x, y, w, h
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def show_line(self, st):
+        """The one line over the game: what the bot is doing while it works, or why it paused itself."""
+        phase = st["phase"]
+        if phase == "running":
+            doing = st.get("hunt") or (f"waypoint {st['index'] + 1} of {st['count']}, {st['routine']}"
+                                       if st.get("count") else "attacking in place")
+            hp, mp = st.get("hp"), st.get("mp")
+            bars = " · ".join(f"{n} {v:.0%}" for n, v in (("HP", hp), ("MP", mp)) if v is not None)
+            text = f"● {doing}" + (f" · {bars}" if bars else "") + \
+                   f"   ({self.cfg['hotkeys']['toggle'].upper()} pause)"
+            self.status_line.show(self.game_rect(), text)
+        elif phase == "paused" and st.get("reason"):
+            self.status_line.show(self.game_rect(), f"Paused: {st['reason']}. "
+                                  f"{self.cfg['hotkeys']['toggle'].upper()} resumes.", LINE_RED)
+        elif phase == "unfocused":
+            self.status_line.show(self.game_rect(), "Waiting: click into the game window", LINE_AMBER)
+        else:
+            self.status_line.hide()
+
+    def open_view(self):
+        """A window showing what the bot sees while hunting: you, your reach, the monsters and its target."""
+        if self.view_win is not None:
+            self.view_win.lift()
+            return
+        self.view_win = tk.Toplevel(self.root)
+        self.view_win.title("Bot view")
+        self.view_label = ttk.Label(self.view_win, text="Start the bot in hunt mode to see what it sees.",
+                                    anchor="center", padding=20)
+        self.view_label.pack(fill="both", expand=True)
+
+        def closed():
+            self.view_win.destroy()
+            self.view_win = None
+        self.view_win.protocol("WM_DELETE_WINDOW", closed)
+
+    def show_view(self, view):
+        if self.view_win is None or view is None or view is getattr(self, "shown_view", None):
+            return
+        self.shown_view = view
+        photo = to_photo(view)
+        self.view_label.config(image=photo, text="", padding=0)
+        self.view_label.image = photo
+
     def finish_auto_setup(self):
+        """Shows the outcome over the game (a message box would take focus from it)."""
         results, self.setup_results = self.setup_results, None
+        self.setup_updates = queue.Queue()  # the results below cover anything still queued
         self.reload_config()
         self.load_settings_into_form()
+        log = logging.getLogger("bot")
+        start = self.cfg["hotkeys"]["toggle"].upper()
         problems = [msg for ok, msg in results or [] if not ok]
-        if problems:
-            messagebox.showwarning("Auto setup: things to fix", "\n\n".join(problems))
+        if self.setup_cancel.is_set():
+            self.overlay.finish("Auto setup cancelled", [], "", 3)
+        elif problems:
+            log.warning("Auto setup finished with %d thing(s) to fix (above).", len(problems))
+            self.overlay.finish(f"Auto setup: {len(problems)} thing{'s' if len(problems) > 1 else ''} to fix",
+                                problems, f"Details are in the panel's log. {start} starts the bot anyway.",
+                                10 + 5 * len(problems))
         else:
-            messagebox.showinfo("Auto setup", "Everything checked out. Press Start when you're ready.")
+            log.info("Auto setup finished: everything checked out. Press %s to start.", start)
+            self.overlay.finish("Auto setup: all set", [], f"Press {start} to start the bot.", 6)
 
     def show_status(self, st):
         phase = st["phase"]
@@ -270,7 +358,10 @@ class App:
         pos = st.get("pos")
         self.info["pos"].config(text=f"{pos[0]:.0f}, {pos[1]:.0f}" if pos else "not found")
         count = st.get("count", 0)
-        if self.cfg.get("mode") == "stand":
+        if self.cfg.get("mode") == "hunt":
+            self.info["waypoint"].config(text=f"hunt: {st['hunt']}" if st.get("hunt") and self.alive()
+                                         else "hunt mode: finds monsters and throws at them")
+        elif self.cfg.get("mode") == "stand":
             jump = (self.cfg.get("stand") or {}).get("jump_every") or 0
             self.info["waypoint"].config(text="stand mode: attacking in place" +
                                          (f", jumping every {jump:g}s" if jump else ""))
@@ -339,7 +430,7 @@ class App:
         """What the bot would see right now, while it isn't running."""
         st = {"phase": "stopped", "reason": None, "pos": None, "others": [], "hp": None, "mp": None, "index": 0,
               "count": len((self.cfg.get("route_data") or {}).get("waypoints") or []), "routine": "", "minimap": None,
-              "lap": 0, "path": []}
+              "lap": 0, "path": [], "hunt": None}
         region = self.cfg["regions"].get("minimap")
         if not region:
             st["preview_msg"] = "No minimap region yet.\nUse Select regions in the Calibrate tab."
@@ -558,6 +649,8 @@ class App:
                                    "F10 (save).", self.record_route),
             ("Forget learned map", "Deletes what the bot learned about the current route's map (platforms, "
                                    "ropes, paths). Recording the route again teaches it afresh.", self.forget_layout),
+            ("Forget learned monsters", "Deletes the monster pictures hunt mode learned (all maps). It learns "
+                                        "them again as monsters get hit.", self.forget_mobs),
             ("Save popup template...", "With a popup on screen (lie detector, death...), box part of it. "
                                        "The bot pauses whenever it appears.", self.save_template),
             ("Open overlay image", "debug/overlay.png from the last regions or check run.", self.open_overlay),
@@ -630,6 +723,17 @@ class App:
             path.unlink(missing_ok=True)
             logging.getLogger("bot").info("Deleted %s.", path.as_posix())
 
+    def forget_mobs(self):
+        folder = Path(self.cfg["hunt"]["mob_dir"])
+        pictures = list(folder.glob("*/*.png"))
+        if not pictures:
+            messagebox.showinfo("Nothing learned yet", "Hunt mode hasn't learned any monsters yet.")
+            return
+        if messagebox.askyesno("Forget learned monsters", f"Delete {len(pictures)} monster pictures?"):
+            for path in pictures:
+                path.unlink(missing_ok=True)
+            logging.getLogger("bot").info("Deleted %d monster pictures.", len(pictures))
+
     def save_template(self):
         name = simpledialog.askstring("Popup template", "Name (letters, digits, - or _), e.g. lie_detector:",
                                       parent=self.root)
@@ -685,17 +789,31 @@ class App:
             self.log_text.see("end")
             self.log_text.config(state="disabled")
 
+        try:
+            while True:
+                self.overlay.add(*self.setup_updates.get_nowait())
+        except queue.Empty:
+            pass
+
         alive, setting_up = self.alive(), self.setting_up()
+        if setting_up and time.monotonic() - self.last_overlay_place > 1:
+            self.last_overlay_place = time.monotonic()
+            self.overlay.place(self.game_rect())  # follows the game window (e.g. once it opens)
         if not alive and self.pending_cfg:
             self.pending_cfg = None
             self.reload_config()
         if not setting_up and self.setup_results is not None:
             self.finish_auto_setup()
         if alive:
-            self.show_status(self.engine.status())
-        elif self.tabs.index("current") == 0 and time.monotonic() - self.last_idle_grab > 0.25:
-            self.last_idle_grab = time.monotonic()
-            self.show_status(self.idle_status())
+            st = self.engine.status()
+            self.show_status(st)
+            self.show_line(st)
+            self.show_view(st.get("view"))
+        else:
+            self.status_line.hide()
+            if self.tabs.index("current") == 0 and time.monotonic() - self.last_idle_grab > 0.25:
+                self.last_idle_grab = time.monotonic()
+                self.show_status(self.idle_status())
         if setting_up:
             self.banner.config(text="Auto setup running... keep the game in front (Stop / F10 cancels)", bg=BLUE)
 
@@ -722,6 +840,8 @@ class App:
             self.setup_cancel.set()
             self.setup_thread.join(timeout=2)
         keyboard.unhook_all()
+        self.overlay.hide()
+        self.status_line.hide()
         self.root.destroy()
 
 

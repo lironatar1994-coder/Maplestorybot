@@ -15,10 +15,25 @@ calibration_file: calibration.yaml
 route: routes/default.yaml
 loop_hz: 15
 
-mode: route            # route = walk the recorded route; stand = attack in place without moving
+mode: route            # route = walk the recorded route; stand = attack in place without moving;
+                       # hunt = find monsters on screen and throw at the ones in range (see hunt: below)
 stand:
   face: null           # left / right: turn that way first; null keeps the current facing
   jump_every: 10       # seconds between jumps while attacking in place (0 = never jump)
+
+hunt:
+  # Hunt mode finds your character by its name tag, and monsters by how they move, by their HP bars and
+  # by pictures it learns of them as they get hit (kept in mob_dir, one folder per map). It only throws at
+  # monsters it sees: it chases the nearest on your level and throws once it's in range. With none in
+  # sight it walks the route (or back and forth) a little at a time, stopping to look.
+  # Ranges are MapleStory Classic's, in pixels of the game at 768 px tall.
+  attack_key: null       # null = keys.attack; or your Lucky Seven key (e.g. shift)
+  range: 200             # how far stars fly: 200, or 400 with the Assassin's Keen Eyes maxed
+  dead_zone: 65          # closer than this the claw punches instead, so it steps back first
+  reach_up: 124          # how far above / below your feet a throw still hits
+  reach_down: 68
+  learn: true            # learn what monsters look like as they get hit
+  mob_dir: mobs
 
 hotkeys:
   toggle: f9    # start / pause
@@ -64,7 +79,7 @@ pathing:
   replan_interval: 0.5   # seconds between path checks while standing on known ground
 
 safety:
-  pause_on_other_player: true
+  pause_on_other_player: false   # true = pause whenever another player is on the minimap
   other_player_frames: 3     # consecutive frames with a red dot before pausing
   lost_player_seconds: 3     # player dot missing this long -> pause (map change, disconnect)
   stuck_seconds: 8           # trying to move but the dot hasn't moved -> pause

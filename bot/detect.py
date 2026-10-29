@@ -1,6 +1,8 @@
 """Finds the game's UI on a captured frame: the minimap, the HP/MP bars and the quickslot keys.
 
-Tuned on the MapleStory Classic World HUD (1024x768). Everything returns None when not found.
+Tuned on the MapleStory Classic World HUD, on frames scaled to 768 px tall (see capture.UI_HEIGHT).
+The HUD sits at the bottom centre, so wider screens only move it sideways. Everything returns None
+when not found.
 """
 from pathlib import Path
 
@@ -10,11 +12,11 @@ import numpy as np
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 _templates = {}
 
-# Quickslot grid: top-left corner of each slot, relative to the window's bottom-right corner.
+# Quickslot grid: top-left corner of each slot, relative to the bottom centre of the frame.
 QUICKSLOT_SIZE = (28, 28)
 QUICKSLOTS = {
-    "shift": (-254, -138), "insert": (-218, -138), "home": (-184, -138), "pageup": (-148, -138),
-    "ctrl": (-254, -104), "delete": (-218, -104), "end": (-184, -104), "pagedown": (-148, -104),
+    "shift": (258, -138), "insert": (294, -138), "home": (328, -138), "pageup": (364, -138),
+    "ctrl": (258, -104), "delete": (294, -104), "end": (328, -104), "pagedown": (364, -104),
 }
 RED = [((0, 150, 100), (8, 255, 255)), ((170, 150, 100), (180, 255, 255))]
 BLUE = [((95, 150, 100), (125, 255, 255))]
@@ -103,7 +105,7 @@ def quickslot_keys(frame):
     sw, sh = QUICKSLOT_SIZE
     red, blue, attack = {}, {}, {}
     for key, (dx, dy) in QUICKSLOTS.items():
-        x, y = w_img + dx, h_img + dy
+        x, y = w_img // 2 + dx, h_img + dy
         if x < 0 or y < 0:
             return {}
         slot = frame[y:y + sh, x:x + sw]

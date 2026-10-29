@@ -58,8 +58,9 @@ def launch_game(target="auto"):
 
 
 class AutoSetup:
-    def __init__(self, cfg, cancel=None, launch=True):
+    def __init__(self, cfg, cancel=None, launch=True, on_update=None):
         self.cfg = cfg
+        self.on_update = on_update  # called (ok, message) from this thread; ok None = what it's doing now
         self.k = cfg["keys"]
         self.cancel = cancel or threading.Event()
         self.launch = launch
@@ -71,6 +72,13 @@ class AutoSetup:
     def note(self, ok, message):
         self.results.append((ok, message))
         (log.info if ok else log.warning)("%s %s", "OK  " if ok else "FIX ", message)
+        if self.on_update:
+            self.on_update(ok, message)
+
+    def say(self, message):
+        log.info(message)
+        if self.on_update:
+            self.on_update(None, message)
 
     def sleep(self, seconds):
         end = time.monotonic() + seconds
@@ -88,7 +96,7 @@ class AutoSetup:
     def ensure_focus(self, timeout=30):
         if self.game.is_foreground() or self.game.bring_to_front():
             return
-        log.info("Click into the game window so I can test the keys...")
+        self.say("Click into the game window so I can test the keys...")
         end = time.monotonic() + timeout
         while not self.game.is_foreground():
             if time.monotonic() > end:
@@ -143,7 +151,7 @@ class AutoSetup:
         if not self.launch:
             raise SetupError("The game isn't running. Open it (or tick 'Open the game') and try again.")
         started = launch_game(self.cfg.get("launch", "auto"))
-        log.info("Opened the game (%s). Log in, pick your character and enter a map.", started)
+        self.say(f"Opened the game ({started}). Log in, pick your character and enter a map.")
         end = time.monotonic() + 180
         while not self.game.locate():
             if time.monotonic() > end:
@@ -165,12 +173,13 @@ class AutoSetup:
                 raise SetupError("Didn't see the minimap in time. Log in, enter a map, open the minimap, "
                                  "keep the game uncovered, and run Auto setup again.")
             if now - last_hint > 20:
-                log.info("Waiting for you to be in a map with the minimap open (keep the game uncovered)...")
+                self.say("Waiting for you to be in a map with the minimap open (keep the game uncovered)...")
                 last_hint = now
             self.sleep(1)
 
     def step_player(self, minimap):
         """Finds which yellow dot is you by walking a little and seeing which one moves."""
+        self.say("Finding your dot: walking a step right and left...")
         before = self.dots(minimap)
         if not before:
             raise SetupError("Couldn't find your yellow dot on the minimap.")
@@ -212,6 +221,7 @@ class AutoSetup:
         return hsv
 
     def step_jump(self, minimap, player, hsv):
+        self.say("Testing the jump key...")
         start = self.nearest(self.dots(minimap, hsv), player)
         if not start:
             self.note(False, "Lost your dot before the jump test.")
@@ -232,6 +242,7 @@ class AutoSetup:
                              "Set the Jump key in Settings to the key you jump with.")
 
     def step_bars(self, frame):
+        self.say("Reading the HP/MP bars and your quickslot keys...")
         hp, mp = detect.find_bars(frame)
         self.note(hp is not None, f"HP bar found at {hp}." if hp else "HP bar not found (drink a potion so "
                                                                         "it's not empty, then run again).")
@@ -261,24 +272,25 @@ class AutoSetup:
 
     def save(self, frame, minimap, hp, mp, keys, hsv):
         cal = config.read_yaml(self.cfg["calibration_file"], {}) or {}
-        regions = cal.setdefault("regions", {})
+        regions = vision.Vision(self.cfg).regions_for(frame)  # a bar not found again stays where it was on screen
         regions["minimap"] = minimap
         if hp:
             regions["hp_bar"] = hp
         if mp:
             regions["mp_bar"] = mp
+        cal["regions"], cal["frame_width"] = regions, frame.shape[1]
         config.save_yaml(self.cfg["calibration_file"], cal)
 
         settings = config.read_yaml(config.SETTINGS_FILE, {}) or {}
         config.deep_merge(settings, {"keys": keys, "vision": {"player_hsv": hsv}})
         route = config.read_yaml(self.cfg["route"], {}) or {}
-        if self.cfg.get("mode") != "stand" and not route.get("waypoints"):
-            settings["mode"] = "stand"
-            self.note(True, "No route is recorded yet, so I set Training mode to stand (attack in place). "
-                            "Record a route and switch back to route mode to walk one.")
+        if self.cfg.get("mode") == "route" and not route.get("waypoints"):
+            settings["mode"] = "hunt"
+            self.note(True, "No route is recorded yet, so I set Training mode to hunt (it finds monsters and "
+                            "throws at them, walking back and forth). Record a route to make it walk one.")
         config.save_yaml(config.SETTINGS_FILE, settings)
 
-        merged = dict(self.cfg, regions=regions)
+        merged = dict(self.cfg, regions=regions, calibrated_width=frame.shape[1])
         merged["vision"] = dict(self.cfg["vision"], player_hsv=hsv)
         state = vision.Vision(merged).read(frame)
         Path("debug").mkdir(exist_ok=True)

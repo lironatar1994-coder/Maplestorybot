@@ -2,10 +2,16 @@
 import ctypes
 import os
 
+import cv2
 import mss
 import numpy as np
 import win32gui
 import win32process
+
+# The game lays its UI out for a 768 px tall window and scales it to the real height (1.41x in a
+# 1920x1080 fullscreen). Frames are scaled back to this height, so the minimap, HUD, templates and
+# calibration are the same size on every screen.
+UI_HEIGHT = 768
 
 
 def set_dpi_aware():
@@ -109,7 +115,8 @@ class GameWindow:
         return self.hwnd is not None and win32gui.GetForegroundWindow() == self.hwnd
 
     def grab(self):
-        """Returns the client area as a BGR image, or None if the window is missing or minimized."""
+        """Returns the client area as a BGR image scaled to UI_HEIGHT px tall, or None if the window is missing
+        or minimized."""
         if not self.hwnd or not win32gui.IsWindow(self.hwnd):
             if not self.locate():
                 return None
@@ -117,4 +124,8 @@ class GameWindow:
         if w <= 0 or h <= 0:
             return None
         shot = self._sct.grab({"left": x, "top": y, "width": w, "height": h})
-        return np.ascontiguousarray(np.asarray(shot)[:, :, :3])
+        img = np.asarray(shot)[:, :, :3]
+        if h == UI_HEIGHT:
+            return np.ascontiguousarray(img)
+        return cv2.resize(img, (round(w * UI_HEIGHT / h), UI_HEIGHT),
+                          interpolation=cv2.INTER_AREA if h > UI_HEIGHT else cv2.INTER_LINEAR)
